@@ -95,8 +95,13 @@ RUNS_DIR = APP_DIR / "runs"
 BATCH_MACRO_FILE = MACROS_DIR / "BatchProcess.ijm"
 MAIN_MACRO_FILE = MACROS_DIR / "AnalyzeSporesAndGermlings.ijm"
 
-# Column holding the manual classification identifier (integer).
-TARGET_COLUMN = "manual_class"
+# Default name of the column holding the manual classification identifier (integer).
+# Can be changed in the GUI for datasets that name it differently.
+DEFAULT_TARGET_COLUMN = "class"
+
+# Default Analyze Particles size bounds (ImageJ units, usually pixels).
+DEFAULT_SIZE_MIN = 50.0
+DEFAULT_SIZE_MAX = 500.0
 
 # Only these ImageJ Analyze Particles columns are used as features. Any other
 # columns in the data are ignored. Missing ones are reported and skipped.
@@ -124,6 +129,8 @@ IMAGEJ_URLS = {
 
 RUN_DIR_PROPERTY = "roi.runDir"  # JVM property: run folder the macros write into
 MAIN_MACRO_PROPERTY = "roi.mainMacro"  # JVM property: full path to the main macro
+SIZE_MIN_PROPERTY = "roi.sizeMin"  # JVM property: Analyze Particles minimum size
+SIZE_MAX_PROPERTY = "roi.sizeMax"  # JVM property: Analyze Particles maximum size
 RANDOM_STATE = 42
 SFS_CV_FOLDS = 5
 SFS_TOLERANCE = 1e-3
@@ -152,6 +159,9 @@ class AppState:
     dataset_path: str = ""
     images_dir: str = ""
     test_size: float = DEFAULT_TEST_SIZE
+    target_column: str = DEFAULT_TARGET_COLUMN
+    size_min: float = DEFAULT_SIZE_MIN
+    size_max: float = DEFAULT_SIZE_MAX
 
     @classmethod
     def load(cls) -> "AppState":
@@ -249,7 +259,9 @@ def _find_java() -> str:
     )
 
 
-def run_imagej_batch(input_dir: Path, output_dir: Path, log: Log) -> list[Path]:
+def run_imagej_batch(
+    input_dir: Path, output_dir: Path, size_min: float, size_max: float, log: Log
+) -> list[Path]:
     """Run the batch macro over input_dir and return the CSV files it produced."""
     for macro in (BATCH_MACRO_FILE, MAIN_MACRO_FILE):
         if not macro.is_file():
@@ -262,6 +274,8 @@ def run_imagej_batch(input_dir: Path, output_dir: Path, log: Log) -> list[Path]:
         java,
         f"-D{RUN_DIR_PROPERTY}={output_dir}",
         f"-D{MAIN_MACRO_PROPERTY}={MAIN_MACRO_FILE}",
+        f"-D{SIZE_MIN_PROPERTY}={size_min:g}",
+        f"-D{SIZE_MAX_PROPERTY}={size_max:g}",
         "-jar",
         str(ij_jar),
         "-batch",
@@ -334,20 +348,24 @@ def select_features(
 
 
 def load_model_dataset(
-    csv_path: Path, log: Log
+    csv_path: Path, target_column: str, log: Log
 ) -> tuple[pd.DataFrame, pd.Series, list[str]]:
     """Load the labelled model dataset. Returns (X, y, feature_names)."""
+    target = target_column.strip()
     df = _clean_columns(pd.read_csv(csv_path))
-    if TARGET_COLUMN not in df.columns:
-        raise ValueError(f"Dataset has no '{TARGET_COLUMN}' column: {csv_path.name}")
+    if target not in df.columns:
+        raise ValueError(
+            f"Dataset has no column named '{target}' (the target column). "
+            f"Set the target column to match the dataset: {csv_path.name}"
+        )
 
     features = select_features(df.columns, log)
-    data = df[features + [TARGET_COLUMN]].dropna()
+    data = df[features + [target]].dropna()
     if len(data) < len(df):
         log(f"Dropped {len(df) - len(data)} row(s) with missing values.")
 
     X = data[features].astype(float)
-    y = data[TARGET_COLUMN].round().astype(int)
+    y = data[target].round().astype(int)
     log(
         f"Loaded {len(X)} labelled ROIs, {len(features)} candidate features, "
         f"{y.nunique()} classes: {sorted(y.unique().tolist())}"
@@ -705,6 +723,9 @@ class ROIClassifierApp(tk.Tk):
         self.dataset_var = tk.StringVar(value=self.state_data.dataset_path)
         self.images_var = tk.StringVar(value=self.state_data.images_dir)
         self.test_size_var = tk.StringVar(value=str(self.state_data.test_size))
+        self.target_var = tk.StringVar(value=self.state_data.target_column)
+        self.size_min_var = tk.StringVar(value=f"{self.state_data.size_min:g}")
+        self.size_max_var = tk.StringVar(value=f"{self.state_data.size_max:g}")
         self.status_var = tk.StringVar(value="")
 
         self._build_widgets()
@@ -730,6 +751,24 @@ class ROIClassifierApp(tk.Tk):
         )
         ttk.Entry(inputs, textvariable=self.test_size_var, width=8).grid(
             row=2, column=1, sticky="w", pady=(6, 0)
+        )
+        ttk.Label(inputs, text="Target column").grid(
+            row=3, column=0, sticky="w", pady=(6, 0)
+        )
+        ttk.Entry(inputs, textvariable=self.target_var, width=20).grid(
+            row=3, column=1, sticky="w", pady=(6, 0)
+        )
+        ttk.Label(inputs, text="Particle size min / max").grid(
+            row=4, column=0, sticky="w", pady=(6, 0)
+        )
+        size_frame = ttk.Frame(inputs)
+        size_frame.grid(row=4, column=1, sticky="w", pady=(6, 0))
+        ttk.Entry(size_frame, textvariable=self.size_min_var, width=8).pack(
+            side=tk.LEFT
+        )
+        ttk.Label(size_frame, text="  to  ").pack(side=tk.LEFT)
+        ttk.Entry(size_frame, textvariable=self.size_max_var, width=8).pack(
+            side=tk.LEFT
         )
 
         actions = ttk.Frame(self, padding=(10, 4))
@@ -762,6 +801,9 @@ class ROIClassifierApp(tk.Tk):
 
         log_tab = ttk.Frame(self.notebook)
         self.notebook.add(log_tab, text="Log")
+        ttk.Button(log_tab, text="Clear log", command=self._clear_log).pack(
+            anchor="e", padx=4, pady=(4, 0)
+        )
         self.log_text = ScrolledText(log_tab, wrap="word", state="disabled", height=12)
         self.log_text.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
 
@@ -817,11 +859,34 @@ class ROIClassifierApp(tk.Tk):
     def _save_inputs(self) -> None:
         self.state_data.dataset_path = self.dataset_var.get()
         self.state_data.images_dir = self.images_var.get()
+        self.state_data.target_column = (
+            self.target_var.get().strip() or DEFAULT_TARGET_COLUMN
+        )
         try:
             self.state_data.test_size = self._parse_test_size()
+            (
+                self.state_data.size_min,
+                self.state_data.size_max,
+            ) = self._parse_size_bounds()
         except ValueError:
-            pass
+            pass  # invalid values are reported when a run starts
         self.state_data.save()
+
+    def _parse_target(self) -> str:
+        target = self.target_var.get().strip()
+        if not target:
+            raise ValueError("Enter the name of the target (classification) column.")
+        return target
+
+    def _parse_size_bounds(self) -> tuple[float, float]:
+        try:
+            low = float(self.size_min_var.get().strip())
+            high = float(self.size_max_var.get().strip())
+        except ValueError:
+            raise ValueError("Particle size bounds must be numbers.") from None
+        if low < 0 or high < low:
+            raise ValueError("Particle size bounds need 0 <= min <= max.")
+        return low, high
 
     def _parse_test_size(self) -> float:
         try:
@@ -898,6 +963,11 @@ class ROIClassifierApp(tk.Tk):
         else:
             self.progress.stop()
 
+    def _clear_log(self) -> None:
+        self.log_text.configure(state="normal")
+        self.log_text.delete("1.0", tk.END)
+        self.log_text.configure(state="disabled")
+
     def _log(self, message: str) -> None:
         self._write_log([message])
 
@@ -922,13 +992,14 @@ class ROIClassifierApp(tk.Tk):
         try:
             dataset = _require_file(self.dataset_var.get(), "model dataset CSV")
             test_size = self._parse_test_size()
+            target = self._parse_target()
         except ValueError as exc:
             messagebox.showwarning("Missing input", str(exc))
             return
         self._save_inputs()
 
         def job(log: Log):
-            X, y, _ = load_model_dataset(dataset, log)
+            X, y, _ = load_model_dataset(dataset, target, log)
             labels = load_class_labels(sorted(y.unique().tolist()), log)
             result = evaluate_split(X, y, test_size, labels, log)
             log(result.summary)
@@ -959,13 +1030,14 @@ class ROIClassifierApp(tk.Tk):
     def _on_select_features(self) -> None:
         try:
             dataset = _require_file(self.dataset_var.get(), "model dataset CSV")
+            target = self._parse_target()
         except ValueError as exc:
             messagebox.showwarning("Missing input", str(exc))
             return
         self._save_inputs()
 
         def job(log: Log):
-            X, y, _ = load_model_dataset(dataset, log)
+            X, y, _ = load_model_dataset(dataset, target, log)
             load_class_labels(
                 sorted(y.unique().tolist()), log
             )  # validate before training
@@ -1001,6 +1073,7 @@ class ROIClassifierApp(tk.Tk):
             dataset = _require_file(self.dataset_var.get(), "model dataset CSV")
             images = _require_dir(self.images_var.get(), "image folder")
             bundle = load_model_for_dataset(dataset)
+            size_min, size_max = self._parse_size_bounds()
         except (ValueError, FileNotFoundError) as exc:
             messagebox.showwarning("Model not ready", str(exc))
             return
@@ -1009,7 +1082,7 @@ class ROIClassifierApp(tk.Tk):
         def job(log: Log):
             labels = load_class_labels(bundle["classes"], log)
             run_dir = RUNS_DIR / _timestamp()
-            csv_files = run_imagej_batch(images, run_dir, log)
+            csv_files = run_imagej_batch(images, run_dir, size_min, size_max, log)
             if not csv_files:
                 raise RuntimeError("The batch macro produced no CSV files.")
             result = classify_rois(bundle, csv_files, labels, log)

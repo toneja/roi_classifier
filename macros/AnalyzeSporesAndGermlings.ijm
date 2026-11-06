@@ -34,6 +34,11 @@ run("Fill Holes");
 run("Set Measurements...", "area centroid perimeter fit shape feret's redirect=None decimal=3");
 // Clear the shared Results table so each image's CSV holds only its own ROIs
 run("Clear Results");
-run("Analyze Particles...", "size=20-440 circularity=0.00-1.00 show=Overlay exclude include add");
+// Particle size bounds, passed in by the app (defaults 50-500 if not set)
+sizeMin = call("java.lang.System.getProperty", "roi.sizeMin");
+sizeMax = call("java.lang.System.getProperty", "roi.sizeMax");
+if (sizeMin == "null") sizeMin = "50";
+if (sizeMax == "null") sizeMax = "500";
+run("Analyze Particles...", "size=" + sizeMin + "-" + sizeMax + " circularity=0.00-1.00 show=Overlay exclude include add");
 roiManager("Show None");
 saveAs("Results", runDir + File.getNameWithoutExtension(getTitle()) + ".csv");
