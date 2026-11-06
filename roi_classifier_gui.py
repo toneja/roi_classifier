@@ -59,7 +59,7 @@ import traceback
 import urllib.request
 import zipfile
 from collections import deque
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Callable
@@ -133,7 +133,7 @@ SIZE_MIN_PROPERTY = "roi.sizeMin"  # JVM property: Analyze Particles minimum siz
 SIZE_MAX_PROPERTY = "roi.sizeMax"  # JVM property: Analyze Particles maximum size
 RANDOM_STATE = 42
 SFS_CV_FOLDS = 5
-SFS_TOLERANCE = 1e-3
+DEFAULT_N_FEATURES = 8  # features forward selection keeps; set in the GUI
 DEFAULT_TEST_SIZE = 0.25
 
 POLL_INTERVAL_MS = 100  # how often the UI checks for worker events
@@ -162,6 +162,8 @@ class AppState:
     target_column: str = DEFAULT_TARGET_COLUMN
     size_min: float = DEFAULT_SIZE_MIN
     size_max: float = DEFAULT_SIZE_MAX
+    n_features: int = DEFAULT_N_FEATURES
+    class_names: dict[str, str] = field(default_factory=dict)  # JSON keys are strings
 
     @classmethod
     def load(cls) -> "AppState":
@@ -399,19 +401,25 @@ def load_roi_tables(
     return combined
 
 
-def load_class_labels(expected_classes: list[int], log: Log) -> dict[int, str]:
-    """
-    Read class_labels.txt (a Python dict of {int: str}) and check it against the
-    model's classes. Without the file, generic 'class <n>' names are used.
-    """
-    if not CLASS_LABELS_FILE.is_file():
-        log("No class_labels.txt found; using generic class names.")
-        return {cls: f"class {cls}" for cls in expected_classes}
+def read_dataset_classes(csv_path: Path, target_column: str) -> tuple[int, list[int]]:
+    """Return (labelled ROI count, sorted classes) for the GUI, without a full load."""
+    df = _clean_columns(pd.read_csv(csv_path))
+    target = target_column.strip()
+    if target not in df.columns:
+        raise ValueError(f"no column named '{target}'")
+    values = df[target].dropna().round().astype(int)
+    return len(values), sorted(values.unique().tolist())
 
+
+LABELS_FORMAT_HINT = '{ -1: "debris", 0: "ungerminated", 1: "germinated" }'
+
+
+def parse_class_labels(text: str, source: str) -> dict[int, str]:
+    """Parse and sanity-check a {int: str} label dict written as a Python literal."""
     try:
-        raw = ast.literal_eval(CLASS_LABELS_FILE.read_text(encoding="utf-8").strip())
+        raw = ast.literal_eval(text.strip())
     except (ValueError, SyntaxError) as exc:
-        raise ValueError(f"class_labels.txt could not be parsed: {exc}") from None
+        raise ValueError(f"{source} could not be parsed: {exc}") from None
 
     valid = isinstance(raw, dict) and all(
         isinstance(k, int) and not isinstance(k, bool) and isinstance(v, str)
@@ -419,36 +427,58 @@ def load_class_labels(expected_classes: list[int], log: Log) -> dict[int, str]:
     )
     if not valid:
         raise ValueError(
-            "class_labels.txt must hold a dict of {int: str}, e.g. "
-            '{ -1: "debris", 0: "ungerminated", 1: "germinated" }'
+            f"{source} must hold a dict of {{int: str}}, e.g. {LABELS_FORMAT_HINT}"
         )
 
     empty = [k for k, v in raw.items() if not v.strip()]
     if empty:
-        raise ValueError(f"class_labels.txt has empty label names for classes: {empty}")
+        raise ValueError(f"{source} has empty label names for classes: {empty}")
 
     names = list(raw.values())
     duplicates = sorted({n for n in names if names.count(n) > 1})
     if duplicates:
         raise ValueError(
-            f"class_labels.txt uses the same label for more than one class: {duplicates}"
+            f"{source} uses the same label for more than one class: {duplicates}"
         )
 
+    return {int(k): v for k, v in raw.items()}
+
+
+def load_class_labels(
+    expected_classes: list[int], log: Log, typed: dict[int, str] | None = None
+) -> dict[int, str]:
+    """
+    Resolve class names and check them against the model's classes.
+    Priority: names set in the app, then class_labels.txt, then generic 'class <n>'.
+    """
+    if typed:
+        labels, source = dict(typed), "set in the app"
+    elif CLASS_LABELS_FILE.is_file():
+        labels = parse_class_labels(
+            CLASS_LABELS_FILE.read_text(encoding="utf-8"), "class_labels.txt"
+        )
+        source = "class_labels.txt"
+    else:
+        log("No class labels given; using generic class names.")
+        return {cls: f"class {cls}" for cls in expected_classes}
+
     model_classes = set(expected_classes)
-    label_classes = set(raw)
+    label_classes = set(labels)
     missing = sorted(model_classes - label_classes)
     extra = sorted(label_classes - model_classes)
     if missing or extra:
         raise ValueError(
-            "class_labels.txt does not match the classes in the model dataset.\n"
+            f"The class labels ({source}) do not match the classes in the model dataset.\n"
             f"  Model classes:            {sorted(model_classes)}\n"
-            f"  Classes in labels file:   {sorted(label_classes)}\n"
-            f"  Missing from labels file: {missing or 'none'}\n"
+            f"  Classes in labels:        {sorted(label_classes)}\n"
+            f"  Missing from labels:      {missing or 'none'}\n"
             f"  Not in the model dataset: {extra or 'none'}"
         )
 
-    labels = {int(k): v for k, v in raw.items()}
-    log(f"Class labels: {', '.join(f'{k} = {labels[k]}' for k in sorted(labels))}")
+    log(
+        f"Class labels from {source}: "
+        f"{', '.join(f'{k} = {labels[k]}' for k in sorted(labels))}"
+    )
     return labels
 
 
@@ -461,13 +491,22 @@ def build_pipeline() -> Pipeline:
     return make_pipeline(StandardScaler(), LogisticRegression(max_iter=1000))
 
 
-def forward_select(X: pd.DataFrame, y: pd.Series, log: Log) -> list[str]:
+def forward_select(
+    X: pd.DataFrame, y: pd.Series, n_features: int, log: Log
+) -> list[str]:
     """Forward Sequential Feature Selection scored by cross-validated accuracy."""
-    log("Running forward feature selection (this can take a moment) ...")
+    if n_features > X.shape[1]:
+        raise ValueError(
+            f"Features to select ({n_features}) is more than the {X.shape[1]} "
+            "candidate features in the dataset."
+        )
+    log(
+        f"Running forward feature selection for {n_features} features "
+        "(this can take a moment) ..."
+    )
     selector = SequentialFeatureSelector(
         build_pipeline(),
-        n_features_to_select="auto",
-        tol=SFS_TOLERANCE,
+        n_features_to_select=n_features,
         direction="forward",
         scoring="accuracy",
         cv=SFS_CV_FOLDS,
@@ -496,13 +535,18 @@ class EvaluationResult:
 
 
 def evaluate_split(
-    X: pd.DataFrame, y: pd.Series, test_size: float, labels: dict[int, str], log: Log
+    X: pd.DataFrame,
+    y: pd.Series,
+    test_size: float,
+    n_features: int,
+    labels: dict[int, str],
+    log: Log,
 ) -> EvaluationResult:
     """Train/test evaluation. Feature selection sees only the training split."""
     X_train, X_test, y_train, y_test = train_test_split(
         X, y, test_size=test_size, stratify=y, random_state=RANDOM_STATE
     )
-    selected = forward_select(X_train, y_train, log)
+    selected = forward_select(X_train, y_train, n_features, log)
     model = build_pipeline().fit(X_train[selected], y_train)
     y_pred = model.predict(X_test[selected])
 
@@ -561,13 +605,14 @@ def build_roc_figure(result: EvaluationResult, labels: dict[int, str]) -> Figure
 
 
 def train_final_model(
-    X: pd.DataFrame, y: pd.Series, dataset_path: str, log: Log
+    X: pd.DataFrame, y: pd.Series, dataset_path: str, n_features: int, log: Log
 ) -> dict:
-    selected = forward_select(X, y, log)
+    selected = forward_select(X, y, n_features, log)
     model = build_pipeline().fit(X[selected], y)
     return {
         "model": model,
         "features": selected,
+        "n_features": n_features,
         "classes": sorted(y.unique().tolist()),
         "trained_on": dataset_path,
         "trained_at": datetime.now().isoformat(timespec="seconds"),
@@ -584,8 +629,12 @@ def model_path_for(dataset: Path) -> Path:
 
 
 def save_model_bundle(bundle: dict, dataset: Path) -> None:
+    """Write the model atomically, replacing any earlier model for this dataset."""
     MODELS_DIR.mkdir(parents=True, exist_ok=True)
-    joblib.dump(bundle, model_path_for(dataset))
+    target = model_path_for(dataset)
+    temp = target.with_suffix(".joblib.tmp")
+    joblib.dump(bundle, temp)
+    os.replace(temp, target)  # overwrites the old model; works on Windows too
 
 
 def load_model_for_dataset(dataset: Path) -> dict:
@@ -709,6 +758,70 @@ def _fill_tree(tree: ttk.Treeview, df: pd.DataFrame) -> None:
         tree.insert("", tk.END, values=[str(v) for v in row])
 
 
+class ClassLabelsDialog(tk.Toplevel):
+    """Name each class found in the loaded dataset. Calls on_save with {class: name}."""
+
+    def __init__(
+        self,
+        parent: tk.Misc,
+        classes: list[int],
+        current: dict[int, str],
+        on_save: Callable[[dict[int, str]], None],
+    ) -> None:
+        super().__init__(parent)
+        self.title("Class labels")
+        self.transient(parent)
+        self.on_save = on_save
+        self.vars: dict[int, tk.StringVar] = {}
+
+        ttk.Label(
+            self,
+            text="Name each class found in the model dataset:",
+            padding=(10, 10, 10, 4),
+        ).grid(row=0, column=0, columnspan=2, sticky="w")
+        for row, cls in enumerate(classes, start=1):
+            ttk.Label(self, text=f"Class {cls}").grid(
+                row=row, column=0, sticky="w", padx=(10, 8), pady=3
+            )
+            var = tk.StringVar(value=current.get(cls, ""))
+            self.vars[cls] = var
+            ttk.Entry(self, textvariable=var, width=30).grid(
+                row=row, column=1, sticky="ew", padx=(0, 10), pady=3
+            )
+
+        buttons = ttk.Frame(self, padding=10)
+        buttons.grid(row=len(classes) + 1, column=0, columnspan=2, sticky="e")
+        ttk.Button(buttons, text="Cancel", command=self.destroy).pack(
+            side=tk.RIGHT, padx=(6, 0)
+        )
+        ttk.Button(buttons, text="Save", command=self._save).pack(side=tk.RIGHT)
+        self.columnconfigure(1, weight=1)
+        self.bind("<Return>", lambda _event: self._save())
+        self.bind("<Escape>", lambda _event: self.destroy())
+
+    def _save(self) -> None:
+        names = {cls: var.get().strip() for cls, var in self.vars.items()}
+        blank = sorted(cls for cls, name in names.items() if not name)
+        if blank:
+            messagebox.showwarning(
+                "Class labels", f"Name every class. Missing: {blank}", parent=self
+            )
+            return
+        counts: dict[str, int] = {}
+        for name in names.values():
+            counts[name] = counts.get(name, 0) + 1
+        duplicates = sorted(name for name, count in counts.items() if count > 1)
+        if duplicates:
+            messagebox.showwarning(
+                "Class labels",
+                f"Each class needs its own name. Repeated: {duplicates}",
+                parent=self,
+            )
+            return
+        self.on_save(names)
+        self.destroy()
+
+
 class ROIClassifierApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
@@ -726,11 +839,19 @@ class ROIClassifierApp(tk.Tk):
         self.target_var = tk.StringVar(value=self.state_data.target_column)
         self.size_min_var = tk.StringVar(value=f"{self.state_data.size_min:g}")
         self.size_max_var = tk.StringVar(value=f"{self.state_data.size_max:g}")
+        self.n_features_var = tk.StringVar(value=str(self.state_data.n_features))
+        self.class_names: dict[int, str] = {
+            int(k): v for k, v in self.state_data.class_names.items()
+        }
+        self.dataset_classes: list[int] | None = None
+        self.dataset_info_var = tk.StringVar(value="")
+        self.class_summary_var = tk.StringVar(value="")
         self.status_var = tk.StringVar(value="")
 
         self._build_widgets()
-        self.dataset_var.trace_add("write", lambda *_: self._refresh_model_status())
-        self._refresh_model_status()
+        self.dataset_var.trace_add("write", lambda *_: self._on_dataset_changed())
+        self.target_var.trace_add("write", lambda *_: self._on_dataset_changed())
+        self._on_dataset_changed()
         self.after(POLL_INTERVAL_MS, self._poll_events)
 
     # -- layout ------------------------------------------------------------
@@ -770,6 +891,29 @@ class ROIClassifierApp(tk.Tk):
         ttk.Entry(size_frame, textvariable=self.size_max_var, width=8).pack(
             side=tk.LEFT
         )
+        ttk.Label(inputs, text="Features to select").grid(
+            row=5, column=0, sticky="w", pady=(6, 0)
+        )
+        ttk.Entry(inputs, textvariable=self.n_features_var, width=8).grid(
+            row=5, column=1, sticky="w", pady=(6, 0)
+        )
+        ttk.Label(inputs, text="Class labels").grid(
+            row=6, column=0, sticky="w", pady=(6, 0)
+        )
+        labels_frame = ttk.Frame(inputs)
+        labels_frame.grid(row=6, column=1, sticky="w", pady=(6, 0))
+        self.labels_button = ttk.Button(
+            labels_frame,
+            text="Edit class labels...",
+            command=self._open_class_labels_dialog,
+        )
+        self.labels_button.pack(side=tk.LEFT)
+        ttk.Label(labels_frame, textvariable=self.class_summary_var).pack(
+            side=tk.LEFT, padx=(10, 0)
+        )
+        ttk.Label(inputs, textvariable=self.dataset_info_var).grid(
+            row=7, column=0, columnspan=3, sticky="w", pady=(6, 0)
+        )
 
         actions = ttk.Frame(self, padding=(10, 4))
         actions.grid(row=1, column=0, sticky="ew")
@@ -778,7 +922,7 @@ class ROIClassifierApp(tk.Tk):
             ttk.Button(actions, text="A. Test accuracy", command=self._on_accuracy),
             ttk.Button(
                 actions,
-                text="B. Select features & train",
+                text="B. Select features & (re)train",
                 command=self._on_select_features,
             ),
             ttk.Button(actions, text="C. Classify images", command=self._on_classify),
@@ -862,15 +1006,26 @@ class ROIClassifierApp(tk.Tk):
         self.state_data.target_column = (
             self.target_var.get().strip() or DEFAULT_TARGET_COLUMN
         )
+        self.state_data.class_names = {str(k): v for k, v in self.class_names.items()}
         try:
             self.state_data.test_size = self._parse_test_size()
             (
                 self.state_data.size_min,
                 self.state_data.size_max,
             ) = self._parse_size_bounds()
+            self.state_data.n_features = self._parse_n_features()
         except ValueError:
             pass  # invalid values are reported when a run starts
         self.state_data.save()
+
+    def _parse_n_features(self) -> int:
+        try:
+            value = int(self.n_features_var.get().strip())
+        except ValueError:
+            raise ValueError("Features to select must be a whole number.") from None
+        if value < 1:
+            raise ValueError("Features to select must be at least 1.")
+        return value
 
     def _parse_target(self) -> str:
         target = self.target_var.get().strip()
@@ -993,15 +1148,17 @@ class ROIClassifierApp(tk.Tk):
             dataset = _require_file(self.dataset_var.get(), "model dataset CSV")
             test_size = self._parse_test_size()
             target = self._parse_target()
+            n_features = self._parse_n_features()
         except ValueError as exc:
             messagebox.showwarning("Missing input", str(exc))
             return
         self._save_inputs()
+        typed_names = dict(self.class_names)
 
         def job(log: Log):
             X, y, _ = load_model_dataset(dataset, target, log)
-            labels = load_class_labels(sorted(y.unique().tolist()), log)
-            result = evaluate_split(X, y, test_size, labels, log)
+            labels = load_class_labels(sorted(y.unique().tolist()), log, typed_names)
+            result = evaluate_split(X, y, test_size, n_features, labels, log)
             log(result.summary)
             stamp = _timestamp()
             REPORTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -1031,25 +1188,78 @@ class ROIClassifierApp(tk.Tk):
         try:
             dataset = _require_file(self.dataset_var.get(), "model dataset CSV")
             target = self._parse_target()
+            n_features = self._parse_n_features()
         except ValueError as exc:
             messagebox.showwarning("Missing input", str(exc))
             return
         self._save_inputs()
+        typed_names = dict(self.class_names)
 
         def job(log: Log):
             X, y, _ = load_model_dataset(dataset, target, log)
-            load_class_labels(
-                sorted(y.unique().tolist()), log
-            )  # validate before training
-            bundle = train_final_model(X, y, str(dataset), log)
+            load_class_labels(sorted(y.unique().tolist()), log, typed_names)  # validate
+            if model_path_for(dataset).is_file():
+                log("Replacing the existing model for this dataset.")
+            bundle = train_final_model(X, y, str(dataset), n_features, log)
             bundle["dataset_sha256"] = file_sha256(dataset)
             save_model_bundle(bundle, dataset)
             log(f"Model saved to {model_path_for(dataset)}")
             return bundle
 
         self._start_task(
-            "Feature selection", job, lambda _bundle: self._refresh_model_status()
+            "Feature selection / model training",
+            job,
+            lambda _bundle: self._refresh_model_status(),
         )
+
+    def _on_dataset_changed(self) -> None:
+        self._load_dataset_classes()
+        self._refresh_model_status()
+
+    def _load_dataset_classes(self) -> None:
+        """Read the selected dataset's classes so the class-label dialog can use them."""
+        path = Path(self.dataset_var.get().strip().strip('"'))
+        target = self.target_var.get().strip() or DEFAULT_TARGET_COLUMN
+        self.dataset_classes = None
+        if not path.is_file():
+            self.dataset_info_var.set("Select a model dataset to load its classes.")
+        else:
+            try:
+                n_rois, classes = read_dataset_classes(path, target)
+            except Exception as exc:
+                self.dataset_info_var.set(f"Dataset not loaded: {exc}")
+            else:
+                self.dataset_classes = classes
+                self.dataset_info_var.set(
+                    f"Loaded {path.name}: {n_rois} labelled ROIs, classes {classes}"
+                )
+        self.labels_button.state(
+            ["!disabled"] if self.dataset_classes else ["disabled"]
+        )
+        self._update_class_summary()
+
+    def _update_class_summary(self) -> None:
+        if self.class_names:
+            self.class_summary_var.set(
+                ", ".join(f"{k} = {v}" for k, v in sorted(self.class_names.items()))
+            )
+        elif CLASS_LABELS_FILE.is_file():
+            self.class_summary_var.set("Using class_labels.txt")
+        else:
+            self.class_summary_var.set("Using generic class names")
+
+    def _open_class_labels_dialog(self) -> None:
+        if not self.dataset_classes:
+            messagebox.showwarning("Load a dataset", "Load a model dataset first.")
+            return
+        ClassLabelsDialog(
+            self, self.dataset_classes, self.class_names, self._set_class_names
+        )
+
+    def _set_class_names(self, names: dict[int, str]) -> None:
+        self.class_names = names
+        self._save_inputs()
+        self._update_class_summary()
 
     def _refresh_model_status(self) -> None:
         """Show the saved model for the dataset currently selected, if there is one."""
@@ -1078,9 +1288,10 @@ class ROIClassifierApp(tk.Tk):
             messagebox.showwarning("Model not ready", str(exc))
             return
         self._save_inputs()
+        typed_names = dict(self.class_names)
 
         def job(log: Log):
-            labels = load_class_labels(bundle["classes"], log)
+            labels = load_class_labels(bundle["classes"], log, typed_names)
             run_dir = RUNS_DIR / _timestamp()
             csv_files = run_imagej_batch(images, run_dir, size_min, size_max, log)
             if not csv_files:
