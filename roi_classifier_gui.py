@@ -689,23 +689,28 @@ def classify_rois(
     counts = pd.crosstab(rois["source"], predictions).reindex(
         index=images, columns=classes, fill_value=0
     )
-    totals = counts.sum(axis=1)
+    # Negative classes (e.g. -1 debris) are left out of totals and percentages,
+    # but their counts are still reported.
+    included = [cls for cls in classes if cls >= 0]
 
     rows = []
     for image in images:
-        total = int(totals[image])
+        total = int(sum(counts.loc[image, cls] for cls in included))
         row: dict[str, object] = {"image": image, "total_rois": total}
         for cls in classes:
             n = int(counts.loc[image, cls])
-            row[f"{labels[cls]} count"] = n
-            row[f"{labels[cls]} %"] = round(100 * n / total, 2) if total else 0.0
+            if cls < 0:
+                row[f"{labels[cls]} count (excluded)"] = n
+            else:
+                row[f"{labels[cls]} count"] = n
+                row[f"{labels[cls]} %"] = round(100 * n / total, 2) if total else 0.0
         rows.append(row)
 
     return ClassificationResult(
         per_image=pd.DataFrame(rows),
         features=features,
         n_images=len(images),
-        total=int(totals.sum()),
+        total=sum(int(row["total_rois"]) for row in rows),
     )
 
 
@@ -747,12 +752,41 @@ def _tree_with_scrollbars(parent: tk.Misc) -> ttk.Treeview:
     return tree
 
 
+UP_ARROW = "▲"
+DOWN_ARROW = "▼"
+
+
+def _sort_key(text: str) -> tuple[int, float | str]:
+    """Numbers sort numerically (a trailing % is ignored); other text sorts alphabetically."""
+    try:
+        return (0, float(text.rstrip("%").strip()))
+    except ValueError:
+        return (1, text.lower())
+
+
+def _sort_by_column(tree: ttk.Treeview, column: str) -> None:
+    """Sort rows by a column. The first click sorts ascending; clicking again reverses."""
+    previous = tree.sort_state
+    descending = previous is not None and previous[0] == column and not previous[1]
+    tree.sort_state = (column, descending)
+
+    rows = [(tree.set(item, column), item) for item in tree.get_children("")]
+    rows.sort(key=lambda row: _sort_key(row[0]), reverse=descending)
+    for position, (_, item) in enumerate(rows):
+        tree.move(item, "", position)
+
+    arrow = f" {DOWN_ARROW if descending else UP_ARROW}"
+    for col in tree["columns"]:
+        tree.heading(str(col), text=str(col) + (arrow if str(col) == column else ""))
+
+
 def _fill_tree(tree: ttk.Treeview, df: pd.DataFrame) -> None:
     tree.delete(*tree.get_children())
+    tree.sort_state = None
     columns = [str(c) for c in df.columns]
     tree["columns"] = columns
     for col in columns:
-        tree.heading(col, text=col)
+        tree.heading(col, text=col, command=lambda c=col: _sort_by_column(tree, c))
         tree.column(col, width=110, anchor=tk.CENTER, stretch=False)
     for _, row in df.iterrows():
         tree.insert("", tk.END, values=[str(v) for v in row])
@@ -963,7 +997,11 @@ class ROIClassifierApp(tk.Tk):
         self.notebook.add(self.counts_tab, text="ROI counts per image")
         ttk.Label(
             self.counts_tab,
-            text="Per image: total ROIs, then each class's count and % of that image's total.",
+            text=(
+                "Per image: total ROIs, then each class's count and % of that total. "
+                "Negative classes are excluded from totals and %, shown as '(excluded)'. "
+                "Click a heading to sort."
+            ),
         ).pack(anchor="w")
         self.per_image_tree = _tree_with_scrollbars(self.counts_tab)
 
